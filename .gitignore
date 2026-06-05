@@ -1,0 +1,6 @@
+config.yaml
+logs/
+blockscanner-*.zip
+blockscanner.log
+.blockscanner.pid
+dist/
