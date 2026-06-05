@@ -3,4 +3,4 @@ logs/
 blockscanner-*.zip
 blockscanner.log
 .blockscanner.pid
-dist/
+blockscanner

@@ -7,7 +7,7 @@ set -e
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_NAME="blockscanner"
-BIN_PATH="$PROJECT_DIR/dist/$BIN_NAME"
+BIN_PATH="$PROJECT_DIR/$BIN_NAME"
 PID_FILE="$PROJECT_DIR/.blockscanner.pid"
 LOG_FILE="$PROJECT_DIR/blockscanner.log"
 

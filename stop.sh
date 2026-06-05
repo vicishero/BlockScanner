@@ -12,7 +12,7 @@ SHUTDOWN_TIMEOUT=30
 
 # --- 通过进程名查找 ---
 find_pids() {
-    pgrep -f "dist/$BIN_NAME" 2>/dev/null || true
+    pgrep -f "$BIN_NAME" 2>/dev/null || true
 }
 
 # --- 检查 PID 文件 ---
