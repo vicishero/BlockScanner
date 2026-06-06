@@ -72,7 +72,7 @@ func (t *Telegram) SendMessage(ctx context.Context, text string) error {
 		return fmt.Errorf("marshal telegram message: %w", err)
 	}
 
-	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", t.baseURL, t.cfg.BotToken)
+	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", t.baseURL, url.PathEscape(t.cfg.BotToken))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create telegram request: %w", err)
@@ -99,6 +99,7 @@ func RedactRPCURL(raw string) string {
 		return "<invalid-rpc-url>"
 	}
 
+	u.User = nil
 	u.RawQuery = ""
 	u.Fragment = ""
 

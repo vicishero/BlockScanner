@@ -76,12 +76,45 @@ func TestTelegramSendMessagePostsPayload(t *testing.T) {
 	}
 }
 
+func TestTelegramSendMessageEscapesBotTokenPathSegment(t *testing.T) {
+	var escapedPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		escapedPath = r.URL.EscapedPath()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	n := NewTelegramWithBaseURL(config.TelegramConfig{
+		Enabled:  true,
+		BotToken: "abc/def?x",
+		ChatID:   "-100123",
+	}, server.URL, server.Client())
+
+	if err := n.SendMessage(context.Background(), "rpc failed"); err != nil {
+		t.Fatalf("SendMessage returned error: %v", err)
+	}
+	if escapedPath != "/botabc%2Fdef%3Fx/sendMessage" {
+		t.Fatalf("escaped path = %q, want /botabc%%2Fdef%%3Fx/sendMessage", escapedPath)
+	}
+}
+
 func TestRedactRPCURL(t *testing.T) {
 	got := RedactRPCURL("https://rpc.example.com/v1/secretToken123456?apikey=abcdef")
 	if strings.Contains(got, "apikey") || strings.Contains(got, "abcdef") || strings.Contains(got, "secretToken123456") {
 		t.Fatalf("redacted URL leaked secret: %s", got)
 	}
 	if !strings.HasPrefix(got, "https://rpc.example.com/") {
+		t.Fatalf("redacted URL = %q, want host preserved", got)
+	}
+}
+
+func TestRedactRPCURLRemovesUserinfo(t *testing.T) {
+	got := RedactRPCURL("https://alice:secret@rpc.example.com/v1/foo?apikey=abcdef")
+	if strings.Contains(got, "alice") || strings.Contains(got, "secret") || strings.Contains(got, "@") {
+		t.Fatalf("redacted URL leaked userinfo: %s", got)
+	}
+	if !strings.Contains(got, "rpc.example.com") {
 		t.Fatalf("redacted URL = %q, want host preserved", got)
 	}
 }
