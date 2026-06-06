@@ -3,6 +3,7 @@ package store
 import (
 	"blockscanner/entity"
 	"context"
+	"time"
 )
 
 // GetEnabledJobs 获取所有启用的定时任务
@@ -10,6 +11,16 @@ func (d *DB) GetEnabledJobs(ctx context.Context) ([]entity.InfraJob, error) {
 	var jobs []entity.InfraJob
 	err := d.WithContext(ctx).
 		Where("status = 1").
+		Where("deleted IS NULL OR deleted = ?", false).
+		Find(&jobs).Error
+	return jobs, err
+}
+
+// GetJobs 获取所有未删除的定时任务，包括暂停任务。
+func (d *DB) GetJobs(ctx context.Context) ([]entity.InfraJob, error) {
+	var jobs []entity.InfraJob
+	err := d.WithContext(ctx).
+		Where("deleted IS NULL OR deleted = ?", false).
 		Find(&jobs).Error
 	return jobs, err
 }
@@ -20,6 +31,7 @@ func (d *DB) UpsertJob(ctx context.Context, job *entity.InfraJob) error {
 	var existing entity.InfraJob
 	err := d.WithContext(ctx).
 		Where("handler_name = ? AND handler_param = ?", job.HandlerName, job.HandlerParam).
+		Where("deleted IS NULL OR deleted = ?", false).
 		First(&existing).Error
 
 	if err == nil {
@@ -29,7 +41,6 @@ func (d *DB) UpsertJob(ctx context.Context, job *entity.InfraJob) error {
 			Updates(map[string]interface{}{
 				"name":            job.Name,
 				"cron_expression": job.CronExpression,
-				"status":          job.Status,
 			}).Error
 	}
 
@@ -48,4 +59,16 @@ func (d *DB) DisableJobByHandlerParam(ctx context.Context, handlerName, handlerP
 // CreateJobLog 记录任务执行日志
 func (d *DB) CreateJobLog(ctx context.Context, jobLog *entity.InfraJobLog) error {
 	return d.WithContext(ctx).Create(jobLog).Error
+}
+
+// UpdateJobLog 更新任务执行日志
+func (d *DB) UpdateJobLog(ctx context.Context, id int64, status int8, message string, endTime time.Time) error {
+	return d.WithContext(ctx).
+		Model(&entity.InfraJobLog{}).
+		Where("id = ?", id).
+		Updates(map[string]interface{}{
+			"status":   status,
+			"message":  message,
+			"end_time": endTime,
+		}).Error
 }

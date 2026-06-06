@@ -10,9 +10,10 @@ import (
 
 // Config 应用配置
 type Config struct {
-	DB  DBConfig  `yaml:"db"`
-	Log LogConfig `yaml:"log"`
-	App AppConfig `yaml:"app"`
+	DB       DBConfig       `yaml:"db"`
+	Log      LogConfig      `yaml:"log"`
+	App      AppConfig      `yaml:"app"`
+	Telegram TelegramConfig `yaml:"telegram"`
 }
 
 // LogConfig 日志配置
@@ -44,6 +45,15 @@ type AppConfig struct {
 	ShutdownTimeoutSecs int `yaml:"shutdown_timeout_secs"`
 }
 
+// TelegramConfig Telegram 通知配置
+type TelegramConfig struct {
+	Enabled             bool   `yaml:"enabled"`
+	BotToken            string `yaml:"bot_token"`
+	ChatID              string `yaml:"chat_id"`
+	RPCFailureThreshold int    `yaml:"rpc_failure_threshold"`
+	CooldownSecs        int    `yaml:"cooldown_secs"`
+}
+
 // defaultConfig 返回内置默认值
 func defaultConfig() *Config {
 	return &Config{
@@ -64,6 +74,13 @@ func defaultConfig() *Config {
 		},
 		App: AppConfig{
 			ShutdownTimeoutSecs: 30,
+		},
+		Telegram: TelegramConfig{
+			Enabled:             false,
+			BotToken:            "",
+			ChatID:              "",
+			RPCFailureThreshold: 5,
+			CooldownSecs:        1800,
 		},
 	}
 }
@@ -122,5 +139,37 @@ func applyEnvOverrides(cfg *Config) {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.App.ShutdownTimeoutSecs = n
 		}
+	}
+	if v := os.Getenv("TELEGRAM_ENABLED"); v != "" {
+		if b, ok := parseBoolEnv(v); ok {
+			cfg.Telegram.Enabled = b
+		}
+	}
+	if v := os.Getenv("TELEGRAM_BOT_TOKEN"); v != "" {
+		cfg.Telegram.BotToken = v
+	}
+	if v := os.Getenv("TELEGRAM_CHAT_ID"); v != "" {
+		cfg.Telegram.ChatID = v
+	}
+	if v := os.Getenv("TELEGRAM_RPC_FAILURE_THRESHOLD"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Telegram.RPCFailureThreshold = n
+		}
+	}
+	if v := os.Getenv("TELEGRAM_COOLDOWN_SECS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.Telegram.CooldownSecs = n
+		}
+	}
+}
+
+func parseBoolEnv(value string) (bool, bool) {
+	switch value {
+	case "1", "t", "T", "true", "TRUE", "True", "yes", "YES", "Yes", "y", "Y", "on", "ON", "On":
+		return true, true
+	case "0", "f", "F", "false", "FALSE", "False", "no", "NO", "No", "n", "N", "off", "OFF", "Off":
+		return false, true
+	default:
+		return false, false
 	}
 }

@@ -36,36 +36,63 @@ func NewChainWorker(db *store.DB, rpcURL string, chainID int64) *ChainWorker {
 // ScanRound 执行一次扫描轮次
 // 返回:
 //
-//	hasMore: true = 还有剩余块需要继续扫
-//	err:     错误信息
-func (w *ChainWorker) ScanRound(ctx context.Context) (hasMore bool, err error) {
+//	hasMore:   true = 还有剩余块需要继续扫
+//	touchedRPC: true = 本轮已尝试访问 RPC
+//	err:       错误信息
+func (w *ChainWorker) ScanRound(ctx context.Context) (hasMore bool, touchedRPC bool, err error) {
+	roundStart := time.Now()
+
 	// 1. 重新加载链配置（获取最新 last_synced_block）
 	chain, err := w.db.GetChainByID(ctx, w.chainID)
 	if err != nil {
-		return false, fmt.Errorf("get chain %d: %w", w.chainID, err)
+		return false, false, fmt.Errorf("get chain %d: %w", w.chainID, err)
 	}
 
 	// 2. 查询该链所有启用的合约事件配置
 	contractEvents, err := w.db.GetEnabledContractEvents(ctx, w.chainID)
 	if err != nil {
-		return false, fmt.Errorf("get contract events: %w", err)
+		return false, touchedRPC, fmt.Errorf("get contract events: %w", err)
 	}
 	if len(contractEvents) == 0 {
 		slog.Debug("no enabled contract events, skip", "chain_id", w.chainID)
-		return false, nil
+		return false, touchedRPC, nil
 	}
 
 	// 3. 调用 eth_blockNumber 获取最新块高
+	blockNumberStart := time.Now()
+	touchedRPC = true
 	latest, err := w.client.BlockNumber(ctx)
 	if err != nil {
-		return false, fmt.Errorf("eth_blockNumber: %w", err)
+		slog.Error("rpc block number failed",
+			"component", "rpc",
+			"chain_id", w.chainID,
+			"duration", time.Since(blockNumberStart).String(),
+			"error", err,
+		)
+		return false, touchedRPC, fmt.Errorf("eth_blockNumber: %w", err)
 	}
+	slog.Debug("rpc block number completed",
+		"component", "rpc",
+		"chain_id", w.chainID,
+		"latest_block", latest,
+		"duration", time.Since(blockNumberStart).String(),
+	)
 
 	// 4. 计算确认后的安全块高
 	confirmed := latest - int64(chain.Confirmations)
 	if confirmed < 0 {
 		confirmed = 0
 	}
+
+	slog.Debug("scan round loaded chain state",
+		"component", "scanner",
+		"chain_id", w.chainID,
+		"chain_name", chain.Name,
+		"latest_block", latest,
+		"confirmed_block", confirmed,
+		"last_synced_block", chain.LastSyncedBlock,
+		"start_block", chain.StartBlock,
+	)
 
 	// 5. 计算起始块高
 	fromBlock := max(chain.LastSyncedBlock, chain.StartBlock)
@@ -85,7 +112,7 @@ func (w *ChainWorker) ScanRound(ctx context.Context) (hasMore bool, err error) {
 			"from", fromBlock,
 			"confirmed", confirmed,
 		)
-		return false, nil
+		return false, touchedRPC, nil
 	}
 
 	// 7. 收集所有 address 和 topic0（去重）
@@ -133,41 +160,49 @@ func (w *ChainWorker) ScanRound(ctx context.Context) (hasMore bool, err error) {
 		toBlock = confirmed
 	}
 
-	slog.Info("scanning blocks",
-		"chain_id", w.chainID,
-		"from", fromBlock,
-		"to", toBlock,
-		"batch_size", batchSize,
-		"remaining", remaining,
-	)
-
 	// 10. 调用 eth_getLogs
 	// topics 过滤: [[topic0_a, topic0_b]] — 所有 topic0 放在第一层，表示 OR
 	topicFilter := [][]string{topic0s}
+	rpcStart := time.Now()
 	logs, err := w.client.GetLogs(ctx, addresses, topicFilter, fromBlock, toBlock)
 	if err != nil {
-		return false, fmt.Errorf("eth_getLogs: %w", err)
+		slog.Error("rpc get logs failed",
+			"component", "rpc",
+			"chain_id", w.chainID,
+			"from_block", fromBlock,
+			"to_block", toBlock,
+			"duration", time.Since(rpcStart).String(),
+			"error", err,
+		)
+		return false, touchedRPC, fmt.Errorf("eth_getLogs: %w", err)
 	}
+	slog.Debug("rpc get logs completed",
+		"component", "rpc",
+		"chain_id", w.chainID,
+		"from_block", fromBlock,
+		"to_block", toBlock,
+		"log_count", len(logs),
+		"duration", time.Since(rpcStart).String(),
+	)
 
 	if len(logs) == 0 {
 		// 没有日志，直接更新块高（空块也要推进）
-		slog.Debug("no logs in range, advancing block",
-			"chain_id", w.chainID,
-			"from", fromBlock,
-			"to", toBlock,
-		)
 		err = w.db.UpdateLastSyncedBlock(ctx, chain.ID, toBlock)
 		if err != nil {
-			return false, fmt.Errorf("update last_synced_block: %w", err)
+			return false, touchedRPC, fmt.Errorf("update last_synced_block: %w", err)
 		}
-		return toBlock < confirmed, nil
+		hasMore = toBlock < confirmed
+		slog.Debug("scan round advanced without logs",
+			"component", "scanner",
+			"chain_id", w.chainID,
+			"from_block", fromBlock,
+			"to_block", toBlock,
+			"last_synced_block", toBlock,
+			"has_more", hasMore,
+			"duration", time.Since(roundStart).String(),
+		)
+		return hasMore, touchedRPC, nil
 	}
-
-	slog.Info("fetched logs",
-		"chain_id", w.chainID,
-		"count", len(logs),
-		"block_range", fmt.Sprintf("%d-%d", fromBlock, toBlock),
-	)
 
 	// 11. 按 (address, topic0) 分组并解码
 	eventLogs := make([]entity.InfraEvmEventLog, 0, len(logs))
@@ -262,12 +297,21 @@ func (w *ChainWorker) ScanRound(ctx context.Context) (hasMore bool, err error) {
 		)
 		// 等待 5 秒后由上层重试
 		time.Sleep(5 * time.Second)
-		return true, err
+		return true, touchedRPC, err
 	}
 
 	// 13. 判断是否还有剩余块
 	hasMore = toBlock < confirmed
-	return hasMore, nil
+	slog.Debug("scan round completed",
+		"component", "scanner",
+		"chain_id", w.chainID,
+		"from_block", fromBlock,
+		"to_block", toBlock,
+		"decoded_logs", len(eventLogs),
+		"has_more", hasMore,
+		"duration", time.Since(roundStart).String(),
+	)
+	return hasMore, touchedRPC, nil
 }
 
 // loadDecoder 加载或更新事件解码器到缓存

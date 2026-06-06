@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +29,40 @@ type jsonRPCResponse struct {
 type jsonRPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+type RPCError struct {
+	Method string
+	Err    error
+}
+
+func (e *RPCError) Error() string {
+	if e == nil || e.Err == nil {
+		return "rpc error"
+	}
+	return fmt.Sprintf("%s: %v", e.Method, e.Err)
+}
+
+func (e *RPCError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func IsRPCError(err error) bool {
+	var rpcErr *RPCError
+	return errors.As(err, &rpcErr)
+}
+
+func wrapRPCError(method string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if IsRPCError(err) {
+		return err
+	}
+	return &RPCError{Method: method, Err: err}
 }
 
 // RPCClient Ethereum JSON-RPC HTTP 客户端
@@ -57,24 +92,24 @@ func (c *RPCClient) call(ctx context.Context, method string, params []interface{
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+		return nil, wrapRPCError(method, fmt.Errorf("marshal request: %w", err))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", c.url, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, wrapRPCError(method, fmt.Errorf("create request: %w", err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("rpc call: %w", err)
+		return nil, wrapRPCError(method, fmt.Errorf("rpc call: %w", err))
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		return nil, wrapRPCError(method, fmt.Errorf("read response: %w", err))
 	}
 
 	// 检查 HTTP 状态码
@@ -83,7 +118,7 @@ func (c *RPCClient) call(ctx context.Context, method string, params []interface{
 		if len(preview) > 200 {
 			preview = preview[:200] + "..."
 		}
-		return nil, fmt.Errorf("http status %d: %s", resp.StatusCode, preview)
+		return nil, wrapRPCError(method, fmt.Errorf("http status %d: %s", resp.StatusCode, preview))
 	}
 
 	var rpcResp jsonRPCResponse
@@ -92,21 +127,21 @@ func (c *RPCClient) call(ctx context.Context, method string, params []interface{
 		if len(preview) > 200 {
 			preview = preview[:200] + "..."
 		}
-		return nil, fmt.Errorf("unmarshal response: %w (body: %s)", err, preview)
+		return nil, wrapRPCError(method, fmt.Errorf("unmarshal response: %w (body: %s)", err, preview))
 	}
 
 	if len(rpcResp.Error) > 0 && string(rpcResp.Error) != "null" {
 		// 尝试解析为标准 JSON-RPC error 对象
 		var rpcErr jsonRPCError
 		if json.Unmarshal(rpcResp.Error, &rpcErr) == nil && rpcErr.Message != "" {
-			return nil, fmt.Errorf("rpc error %d: %s", rpcErr.Code, rpcErr.Message)
+			return nil, wrapRPCError(method, fmt.Errorf("rpc error %d: %s", rpcErr.Code, rpcErr.Message))
 		}
 		// 可能是字符串形式的错误
 		var errStr string
 		if json.Unmarshal(rpcResp.Error, &errStr) == nil {
-			return nil, fmt.Errorf("rpc error: %s", errStr)
+			return nil, wrapRPCError(method, fmt.Errorf("rpc error: %s", errStr))
 		}
-		return nil, fmt.Errorf("rpc error: %s", string(rpcResp.Error))
+		return nil, wrapRPCError(method, fmt.Errorf("rpc error: %s", string(rpcResp.Error)))
 	}
 
 	return rpcResp.Result, nil
@@ -121,7 +156,7 @@ func (c *RPCClient) BlockNumber(ctx context.Context) (int64, error) {
 
 	var hex string
 	if err := json.Unmarshal(result, &hex); err != nil {
-		return 0, fmt.Errorf("unmarshal blockNumber: %w", err)
+		return 0, wrapRPCError("eth_blockNumber", fmt.Errorf("unmarshal blockNumber: %w", err))
 	}
 
 	return hexToInt64(hex), nil
@@ -156,7 +191,7 @@ func (c *RPCClient) GetLogs(ctx context.Context, addresses []string, topics [][]
 
 	var logs []EthLog
 	if err := json.Unmarshal(result, &logs); err != nil {
-		return nil, fmt.Errorf("unmarshal logs: %w", err)
+		return nil, wrapRPCError("eth_getLogs", fmt.Errorf("unmarshal logs: %w", err))
 	}
 
 	return logs, nil

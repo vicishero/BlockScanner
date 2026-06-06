@@ -75,7 +75,7 @@ func (s *EvmScanner) runChainStandalone(ctx context.Context, chain *entity.Infra
 
 		// 执行扫描（最多 10 轮连续追块）
 		for round := 0; round < 10; round++ {
-			hasMore, err := worker.ScanRound(ctx)
+			hasMore, _, err := worker.ScanRound(ctx)
 			if err != nil {
 				slog.Error("scan round error",
 					"chain_id", chain.ChainID,
