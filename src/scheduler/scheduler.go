@@ -322,9 +322,14 @@ func (s *Scheduler) executeScanEvmChain(ctx context.Context, job *entity.InfraJo
 	worker := scanner.NewChainWorker(s.db, chain.RPCURL, chain.ChainID)
 	rounds := 0
 	hasMore := false
+	touchedRPC := false
 	for round := 1; round <= 10; round++ {
 		roundStart := time.Now()
-		hasMore, err = worker.ScanRound(ctx)
+		var roundTouchedRPC bool
+		hasMore, roundTouchedRPC, err = worker.ScanRound(ctx)
+		if roundTouchedRPC {
+			touchedRPC = true
+		}
 		roundDuration := time.Since(roundStart)
 		if err != nil {
 			rpcErr := scanner.IsRPCError(err)
@@ -336,14 +341,21 @@ func (s *Scheduler) executeScanEvmChain(ctx context.Context, job *entity.InfraJo
 		}
 
 		rounds++
-		slog.Info("scan round completed", "component", "scanner", "chain_id", chainID, "round", round, "duration", roundDuration.String(), "has_more", hasMore)
+		slog.Info("scan round completed", "component", "scanner", "chain_id", chainID, "round", round, "duration", roundDuration.String(), "has_more", hasMore, "touched_rpc", roundTouchedRPC)
 		if !hasMore {
 			break
 		}
 	}
 
-	s.alerts.recordSuccess(ctx, chain)
-	return fmt.Sprintf("scan completed: chain_id=%d rounds=%d has_more=%t duration=%s", chainID, rounds, hasMore, time.Since(start).String()), nil
+	recordScanSuccessIfTouchedRPC(ctx, s.alerts, chain, touchedRPC)
+	return fmt.Sprintf("scan completed: chain_id=%d rounds=%d has_more=%t touched_rpc=%t duration=%s", chainID, rounds, hasMore, touchedRPC, time.Since(start).String()), nil
+}
+
+func recordScanSuccessIfTouchedRPC(ctx context.Context, alerts *rpcAlertManager, chain *entity.InfraEvmChain, touchedRPC bool) {
+	if !touchedRPC || alerts == nil {
+		return
+	}
+	alerts.recordSuccess(ctx, chain)
 }
 
 // buildProcessScanEventCmd 构建事件消费任务的 cron 执行函数

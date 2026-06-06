@@ -81,7 +81,7 @@ func (t *Telegram) SendMessage(ctx context.Context, text string) error {
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send telegram message: %w", err)
+		return fmt.Errorf("send telegram message: %s", t.sanitizeError(err))
 	}
 	defer resp.Body.Close()
 
@@ -90,6 +90,20 @@ func (t *Telegram) SendMessage(ctx context.Context, text string) error {
 	}
 
 	return nil
+}
+
+func (t *Telegram) sanitizeError(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	message := err.Error()
+	if t.cfg.BotToken != "" {
+		escapedToken := url.PathEscape(t.cfg.BotToken)
+		message = strings.ReplaceAll(message, escapedToken, "<telegram-bot-token>")
+		message = strings.ReplaceAll(message, t.cfg.BotToken, "<telegram-bot-token>")
+	}
+	return message
 }
 
 // RedactRPCURL removes secrets from an RPC URL while preserving the scheme and host.

@@ -3,6 +3,7 @@ package notifier
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -97,6 +98,43 @@ func TestTelegramSendMessageEscapesBotTokenPathSegment(t *testing.T) {
 	if escapedPath != "/botabc%2Fdef%3Fx/sendMessage" {
 		t.Fatalf("escaped path = %q, want /botabc%%2Fdef%%3Fx/sendMessage", escapedPath)
 	}
+}
+
+func TestTelegramSendMessageRedactsBotTokenFromTransportError(t *testing.T) {
+	const token = "123456:secret-token-value"
+	n := NewTelegramWithBaseURL(config.TelegramConfig{
+		Enabled:  true,
+		BotToken: token,
+		ChatID:   "-100123",
+	}, "https://api.telegram.test", &http.Client{Transport: urlEchoErrorRoundTripper{}})
+
+	err := n.SendMessage(context.Background(), "rpc failed")
+	if err == nil {
+		t.Fatal("SendMessage returned nil error")
+	}
+
+	errorText := err.Error()
+	if strings.Contains(errorText, token) {
+		t.Fatalf("SendMessage error leaked bot token: %s", errorText)
+	}
+	if strings.Contains(errorText, "/bot"+token+"/sendMessage") {
+		t.Fatalf("SendMessage error leaked token endpoint: %s", errorText)
+	}
+	if !strings.Contains(errorText, "send telegram message") {
+		t.Fatalf("SendMessage error missing operation context: %s", errorText)
+	}
+	if !strings.Contains(errorText, "transport failed") {
+		t.Fatalf("SendMessage error missing safe transport context: %s", errorText)
+	}
+	if !strings.Contains(errorText, "<telegram-bot-token>") {
+		t.Fatalf("SendMessage error missing redacted token placeholder: %s", errorText)
+	}
+}
+
+type urlEchoErrorRoundTripper struct{}
+
+func (urlEchoErrorRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("transport failed for %s", req.URL.String())
 }
 
 func TestRedactRPCURL(t *testing.T) {

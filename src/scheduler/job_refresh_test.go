@@ -39,6 +39,27 @@ func TestJobKeys(t *testing.T) {
 	}
 }
 
+func TestRecordScanSuccessOnlyWhenJobTouchedRPC(t *testing.T) {
+	fn := &fakeNotifier{}
+	manager := newRPCAlertManager(fn, 1, time.Hour, func() time.Time { return time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC) })
+	chain := &entity.InfraEvmChain{ChainID: 137, Name: "Polygon", RPCURL: "https://rpc.example.com/key1234567890"}
+
+	manager.recordFailure(context.Background(), chain, assertErr("eth_blockNumber failed"))
+	if len(fn.messages) != 1 {
+		t.Fatalf("messages after failure alert = %d, want 1", len(fn.messages))
+	}
+
+	recordScanSuccessIfTouchedRPC(context.Background(), manager, chain, false)
+	if len(fn.messages) != 1 {
+		t.Fatalf("messages after untouched successful scan = %d, want 1", len(fn.messages))
+	}
+
+	recordScanSuccessIfTouchedRPC(context.Background(), manager, chain, true)
+	if len(fn.messages) != 2 {
+		t.Fatalf("messages after touched successful scan = %d, want 2", len(fn.messages))
+	}
+}
+
 func TestJobContextUsesSchedulerRunContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Scheduler{runCtx: ctx}

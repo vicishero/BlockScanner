@@ -22,7 +22,7 @@ go build -o "$PROJECT_DIR/$BIN_NAME" .
 
 echo "[Build] 复制部署文件..."
 cp "$PROJECT_DIR/$BIN_NAME"   "$BUILD_DIR/"
-cp "$PROJECT_DIR/config.yaml" "$BUILD_DIR/"
+cp "$PROJECT_DIR/config.yaml.sample" "$BUILD_DIR/config.yaml"
 cp "$PROJECT_DIR/start.sh"    "$BUILD_DIR/"
 cp "$PROJECT_DIR/stop.sh"     "$BUILD_DIR/"
 
