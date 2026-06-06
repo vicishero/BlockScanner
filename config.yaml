@@ -1,0 +1,28 @@
+# BlockScanner 配置文件模板
+# 复制此文件为 config.yaml 并修改为实际值
+# 环境变量优先级高于配置文件
+
+db:
+  host: "127.0.0.1"
+  port: 3306
+  user: "root"
+  password: "请修改为实际数据库密码"
+  database: "paopao"
+  max_open_conns: 25
+  max_idle_conns: 10
+  conn_max_lifetime_secs: 300   # 连接最大生命周期（秒），5 分钟
+
+log:
+  dir: "logs"                   # 日志目录，相对于工作目录或绝对路径
+  max_age_days: 30              # 日志保留天数，到期自动删除
+  level: "info"                 # debug | info | warn | error
+
+app:
+  shutdown_timeout_secs: 30     # 优雅关闭超时（秒）
+
+telegram:
+  enabled: false                 # 是否启用 Telegram 通知
+  bot_token: ""                  # Telegram Bot Token，生产建议用环境变量 TELEGRAM_BOT_TOKEN
+  chat_id: ""                    # 运营群 Chat ID，生产建议用环境变量 TELEGRAM_CHAT_ID
+  rpc_failure_threshold: 5       # RPC 连续失败次数达到该值后告警
+  cooldown_secs: 1800            # 持续故障时重复告警冷却时间（秒）
