@@ -91,6 +91,38 @@ func TestMissingBuiltInJobsCreatesOnlyAbsentBuiltIns(t *testing.T) {
 	}
 }
 
+func TestUpsertCronJobKeepsExistingJobWhenReplacementCronIsInvalid(t *testing.T) {
+	s := &Scheduler{cron: cron.New(cron.WithSeconds()), jobs: make(map[string]scheduledJob)}
+	original := &entity.InfraJob{Name: "scan", HandlerName: "scanEvmChain", HandlerParam: "137", CronExpression: "*/2 * * * * *"}
+	s.upsertCronJob(original)
+
+	key := jobKey(original.HandlerName, original.HandlerParam)
+	before, ok := s.jobs[key]
+	if !ok {
+		t.Fatalf("original job was not registered")
+	}
+	if before.entryID == 0 {
+		t.Fatalf("original entryID = 0, want nonzero")
+	}
+
+	invalid := &entity.InfraJob{Name: "scan", HandlerName: "scanEvmChain", HandlerParam: "137", CronExpression: "not a cron"}
+	s.upsertCronJob(invalid)
+
+	after, ok := s.jobs[key]
+	if !ok {
+		t.Fatalf("existing job was removed after invalid replacement cron")
+	}
+	if after.cron != original.CronExpression {
+		t.Fatalf("stored cron = %q, want original %q", after.cron, original.CronExpression)
+	}
+	if after.entryID != before.entryID {
+		t.Fatalf("entryID = %d, want original %d", after.entryID, before.entryID)
+	}
+	if entry := s.cron.Entry(before.entryID); entry.ID != before.entryID {
+		t.Fatalf("cron entry %d was removed after invalid replacement cron", before.entryID)
+	}
+}
+
 func TestSyncJobRefreshAppliesEffectiveJobsAndRemovesStaleCronJobs(t *testing.T) {
 	jobs := []entity.InfraJob{
 		{HandlerName: "scanEvmChain", HandlerParam: "137", CronExpression: "*/2 * * * * *", Status: 1},

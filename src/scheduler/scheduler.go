@@ -175,11 +175,9 @@ func (s *Scheduler) refreshCronJobs(jobs []entity.InfraJob, enabledChains map[in
 func (s *Scheduler) upsertCronJob(job *entity.InfraJob) {
 	key := jobKey(job.HandlerName, job.HandlerParam)
 
-	if existing, ok := s.jobs[key]; ok {
-		if existing.cron == job.CronExpression {
-			return
-		}
-		s.cron.Remove(existing.entryID)
+	existing, hasExisting := s.jobs[key]
+	if hasExisting && existing.cron == job.CronExpression {
+		return
 	}
 
 	// 根据 handler_name 创建对应的 cron 任务
@@ -205,6 +203,9 @@ func (s *Scheduler) upsertCronJob(job *entity.InfraJob) {
 		return
 	}
 
+	if hasExisting {
+		s.cron.Remove(existing.entryID)
+	}
 	s.jobs[key] = scheduledJob{entryID: entryID, cron: job.CronExpression}
 	slog.Info("cron job registered",
 		"component", "scheduler",
@@ -258,7 +259,9 @@ func (s *Scheduler) runWithJobLog(ctx context.Context, job *entity.InfraJob, run
 	}
 
 	if jobLog.ID > 0 {
-		if updateErr := s.db.UpdateJobLog(ctx, jobLog.ID, status, message, time.Now()); updateErr != nil {
+		updateCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if updateErr := s.db.UpdateJobLog(updateCtx, jobLog.ID, status, message, time.Now()); updateErr != nil {
 			slog.Error("update job log failed", "component", "scheduler", "job_id", job.ID, "log_id", jobLog.ID, "handler", job.HandlerName, "error", updateErr)
 		}
 	}
