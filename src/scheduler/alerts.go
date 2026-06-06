@@ -67,10 +67,6 @@ func (m *rpcAlertManager) recordFailure(ctx context.Context, chain *entity.Infra
 	shouldNotify := state.consecutiveFailures >= m.threshold && (state.lastNotifiedAt.IsZero() || m.cooldown <= 0 || currentTime.Sub(state.lastNotifiedAt) >= m.cooldown)
 	failures := state.consecutiveFailures
 	lastError := state.lastError
-	if shouldNotify {
-		state.alerting = true
-		state.lastNotifiedAt = currentTime
-	}
 	m.mu.Unlock()
 
 	if !shouldNotify {
@@ -87,7 +83,16 @@ func (m *rpcAlertManager) recordFailure(ctx context.Context, chain *entity.Infra
 	)
 	if sendErr := m.sender.SendMessage(ctx, message); sendErr != nil {
 		slog.Error("send rpc alert notification failed", "component", "notifier", "chain_id", chain.ChainID, "error", sendErr)
+		return
 	}
+
+	m.mu.Lock()
+	state = m.states[chain.ChainID]
+	if state != nil && state.consecutiveFailures >= failures {
+		state.alerting = true
+		state.lastNotifiedAt = currentTime
+	}
+	m.mu.Unlock()
 }
 
 func (m *rpcAlertManager) recordSuccess(ctx context.Context, chain *entity.InfraEvmChain) {
