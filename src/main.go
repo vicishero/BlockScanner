@@ -53,7 +53,12 @@ func main() {
 	opsNotifier := notifier.NewTelegram(cfg.Telegram)
 
 	// 启动调度器（生产模式：由 cron 驱动扫描）
-	sched := scheduler.New(db, evmScanner, opsNotifier)
+	sched := scheduler.New(
+		db,
+		evmScanner,
+		opsNotifier,
+		scheduler.WithRPCAlertConfig(cfg.Telegram.RPCFailureThreshold, time.Duration(cfg.Telegram.CooldownSecs)*time.Second),
+	)
 	if err := sched.Start(ctx); err != nil {
 		slog.Error("failed to start scheduler", "error", err)
 		os.Exit(1)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +45,13 @@ func WithRefreshInterval(interval time.Duration) Option {
 	}
 }
 
+func WithRPCAlertConfig(threshold int, cooldown time.Duration) Option {
+	return func(s *Scheduler) {
+		s.alerts.threshold = threshold
+		s.alerts.cooldown = cooldown
+	}
+}
+
 // New 创建调度器
 func New(db *store.DB, evmScanner *scanner.EvmScanner, sender notifier.Sender, opts ...Option) *Scheduler {
 	s := &Scheduler{
@@ -65,30 +73,23 @@ func New(db *store.DB, evmScanner *scanner.EvmScanner, sender notifier.Sender, o
 
 // Start 初始化并启动调度器
 func (s *Scheduler) Start(ctx context.Context) error {
-	// 1. 注册处理器
 	s.registerHandlers()
 
-	// 2. 从数据库同步任务
-	if err := s.syncJobs(ctx); err != nil {
-		return fmt.Errorf("sync jobs: %w", err)
+	if err := s.refreshJobs(ctx); err != nil {
+		return fmt.Errorf("refresh jobs: %w", err)
 	}
 
-	// 3. 确保所有链都有对应的定时任务
-	if err := s.ensureJobsForAllChains(ctx); err != nil {
-		slog.Warn("ensure jobs for chains failed", "error", err)
-	}
-
-	// 4. 启动 cron 调度器
 	s.cron.Start()
-	slog.Info("scheduler started")
+	slog.Info("scheduler started", "component", "scheduler", "refresh_interval", s.refreshInterval.String())
 
-	// 5. 监听 ctx 取消
+	go s.runRefreshLoop(ctx)
+
 	go func() {
 		<-ctx.Done()
-		slog.Info("scheduler stopping...")
+		slog.Info("scheduler stopping", "component", "scheduler")
 		stopCtx := s.cron.Stop()
 		<-stopCtx.Done()
-		slog.Info("scheduler stopped")
+		slog.Info("scheduler stopped", "component", "scheduler")
 	}()
 
 	return nil
@@ -96,71 +97,62 @@ func (s *Scheduler) Start(ctx context.Context) error {
 
 // registerHandlers 注册所有任务处理器
 func (s *Scheduler) registerHandlers() {
-	// scanEvmChain 处理器
-	s.cron.AddFunc("placeholder", func() {
-		// 占位，实际由 syncJobs 动态添加
-	})
+	// Cron handlers are registered dynamically from infra_job records.
 }
 
-// syncJobs 从数据库加载启用的任务并注册到 cron
-func (s *Scheduler) syncJobs(ctx context.Context) error {
+func (s *Scheduler) runRefreshLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.refreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.refreshJobs(ctx); err != nil {
+				slog.Error("refresh jobs failed", "component", "scheduler", "error", err)
+			}
+		}
+	}
+}
+
+func (s *Scheduler) refreshJobs(ctx context.Context) error {
+	chains, err := s.db.GetEnabledChains(ctx)
+	if err != nil {
+		return fmt.Errorf("get enabled chains: %w", err)
+	}
+
+	enabledChains := make(map[int64]entity.InfraEvmChain, len(chains))
+	for _, chain := range chains {
+		enabledChains[chain.ChainID] = chain
+
+		job := buildChainScanJob(&chain)
+		if err := s.db.UpsertJob(ctx, job); err != nil {
+			slog.Error("upsert chain scan job failed", "component", "scheduler", "chain_id", chain.ChainID, "error", err)
+		}
+	}
+
+	processJob := buildProcessScanEventJob()
+	if err := s.db.UpsertJob(ctx, processJob); err != nil {
+		slog.Error("upsert process scan event job failed", "component", "scheduler", "error", err)
+	}
+
 	jobs, err := s.db.GetEnabledJobs(ctx)
 	if err != nil {
 		return fmt.Errorf("get enabled jobs: %w", err)
 	}
 
-	chains, err := s.db.GetEnabledChains(ctx)
-	if err != nil {
-		return fmt.Errorf("get enabled chains: %w", err)
-	}
-	enabledChains := make(map[int64]entity.InfraEvmChain, len(chains))
-	for _, chain := range chains {
-		enabledChains[chain.ChainID] = chain
-	}
+	effective := effectiveJobs(jobs, enabledChains)
+	validKeys := jobKeys(effective)
 
 	s.mu.Lock()
-	effectiveCount := s.refreshCronJobs(jobs, enabledChains)
+	for _, job := range effective {
+		s.upsertCronJob(&job)
+	}
+	s.removeStaleCronJobs(validKeys)
 	s.mu.Unlock()
 
-	slog.Info("synced jobs from database", "count", len(jobs), "effective", effectiveCount)
-	return nil
-}
-
-// ensureJobsForAllChains 确保所有启用的链都有对应的 scanEvmChain 定时任务
-func (s *Scheduler) ensureJobsForAllChains(ctx context.Context) error {
-	chains, err := s.db.GetEnabledChains(ctx)
-	if err != nil {
-		return err
-	}
-
-	for _, ch := range chains {
-		job := buildChainScanJob(&ch)
-
-		// 写入数据库
-		if err := s.db.UpsertJob(ctx, job); err != nil {
-			slog.Error("upsert chain scan job failed",
-				"chain_id", ch.ChainID,
-				"error", err,
-			)
-			continue
-		}
-
-		// 注册到 cron
-		s.mu.Lock()
-		s.upsertCronJob(job)
-		s.mu.Unlock()
-	}
-
-	// 确保 processScanEvent 任务存在
-	processJob := buildProcessScanEventJob()
-	if err := s.db.UpsertJob(ctx, processJob); err != nil {
-		slog.Error("upsert process scan event job failed", "error", err)
-	} else {
-		s.mu.Lock()
-		s.upsertCronJob(processJob)
-		s.mu.Unlock()
-	}
-
+	slog.Info("scheduler jobs refreshed", "component", "scheduler", "chains", len(chains), "jobs", len(jobs), "effective", len(effective))
 	return nil
 }
 
@@ -193,13 +185,14 @@ func (s *Scheduler) upsertCronJob(job *entity.InfraJob) {
 	case "processScanEvent":
 		cmd = s.buildProcessScanEventCmd(job)
 	default:
-		slog.Warn("unknown handler", "handler_name", job.HandlerName)
+		slog.Warn("unknown handler", "component", "scheduler", "handler_name", job.HandlerName)
 		return
 	}
 
 	entryID, err := s.cron.AddFunc(job.CronExpression, cmd)
 	if err != nil {
 		slog.Error("add cron job failed",
+			"component", "scheduler",
 			"name", job.Name,
 			"cron", job.CronExpression,
 			"error", err,
@@ -209,6 +202,7 @@ func (s *Scheduler) upsertCronJob(job *entity.InfraJob) {
 
 	s.jobs[key] = scheduledJob{entryID: entryID, cron: job.CronExpression}
 	slog.Info("cron job registered",
+		"component", "scheduler",
 		"name", job.Name,
 		"handler", job.HandlerName,
 		"cron", job.CronExpression,
@@ -225,58 +219,103 @@ func (s *Scheduler) removeStaleCronJobs(validKeys map[string]bool) {
 	}
 }
 
-// buildScanEvmChainCmd 构建扫链任务的 cron 执行函数
-func (s *Scheduler) buildScanEvmChainCmd(job *entity.InfraJob) func() {
-	return func() {
-		ctx := context.Background()
+func (s *Scheduler) runWithJobLog(ctx context.Context, job *entity.InfraJob, run func(context.Context) (string, error)) {
+	start := time.Now()
+	jobLog := entity.InfraJobLog{
+		JobID:     job.ID,
+		Status:    0,
+		Message:   "running",
+		StartTime: start,
+	}
+	if err := s.db.CreateJobLog(ctx, &jobLog); err != nil {
+		slog.Error("create job log failed", "component", "scheduler", "job_id", job.ID, "handler", job.HandlerName, "error", err)
+	}
 
-		// 解析 chain_id
-		var chainID int64
-		if _, err := fmt.Sscanf(job.HandlerParam, "%d", &chainID); err != nil {
-			slog.Error("invalid handler_param for scanEvmChain",
-				"param", job.HandlerParam,
-				"error", err,
-			)
-			return
-		}
+	message, err := run(ctx)
+	status := int8(1)
+	if err != nil {
+		status = 2
+		message = err.Error()
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "completed"
+	}
 
-		// 获取链配置
-		chain, err := s.db.GetChainByID(ctx, chainID)
-		if err != nil {
-			slog.Error("chain not found",
-				"chain_id", chainID,
-				"error", err,
-			)
-			return
-		}
-
-		// 创建 worker 并循环最多 10 轮
-		worker := scanner.NewChainWorker(s.db, chain.RPCURL, chain.ChainID)
-
-		for round := 0; round < 10; round++ {
-			hasMore, err := worker.ScanRound(ctx)
-			if err != nil {
-				slog.Error("scan round error",
-					"chain_id", chainID,
-					"round", round,
-					"error", err,
-				)
-				break
-			}
-			if !hasMore {
-				break // 已追到最新块
-			}
+	if jobLog.ID > 0 {
+		if updateErr := s.db.UpdateJobLog(ctx, jobLog.ID, status, message, time.Now()); updateErr != nil {
+			slog.Error("update job log failed", "component", "scheduler", "job_id", job.ID, "log_id", jobLog.ID, "handler", job.HandlerName, "error", updateErr)
 		}
 	}
+
+	duration := time.Since(start)
+	if err != nil {
+		slog.Error("job failed", "component", "scheduler", "job_id", job.ID, "handler", job.HandlerName, "duration", duration.String(), "error", err)
+		return
+	}
+	slog.Info("job completed", "component", "scheduler", "job_id", job.ID, "handler", job.HandlerName, "duration", duration.String(), "message", message)
+}
+
+// buildScanEvmChainCmd 构建扫链任务的 cron 执行函数
+func (s *Scheduler) buildScanEvmChainCmd(job *entity.InfraJob) func() {
+	jobCopy := *job
+	return func() {
+		ctx := context.Background()
+		s.runWithJobLog(ctx, &jobCopy, func(ctx context.Context) (string, error) {
+			return s.executeScanEvmChain(ctx, &jobCopy)
+		})
+	}
+}
+
+func (s *Scheduler) executeScanEvmChain(ctx context.Context, job *entity.InfraJob) (string, error) {
+	start := time.Now()
+
+	chainID, err := strconv.ParseInt(job.HandlerParam, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("invalid handler_param for scanEvmChain %q: %w", job.HandlerParam, err)
+	}
+
+	chain, err := s.db.GetChainByID(ctx, chainID)
+	if err != nil {
+		return "", fmt.Errorf("get chain %d: %w", chainID, err)
+	}
+
+	worker := scanner.NewChainWorker(s.db, chain.RPCURL, chain.ChainID)
+	rounds := 0
+	hasMore := false
+	for round := 1; round <= 10; round++ {
+		roundStart := time.Now()
+		hasMore, err = worker.ScanRound(ctx)
+		roundDuration := time.Since(roundStart)
+		if err != nil {
+			rpcErr := scanner.IsRPCError(err)
+			if rpcErr {
+				s.alerts.recordFailure(ctx, chain, err)
+			}
+			slog.Error("scan round error", "component", "scanner", "chain_id", chainID, "round", round, "duration", roundDuration.String(), "rpc_error", rpcErr, "error", err)
+			return fmt.Sprintf("scan failed: chain_id=%d round=%d rpc_error=%t duration=%s", chainID, round, rpcErr, time.Since(start).String()), err
+		}
+
+		rounds++
+		s.alerts.recordSuccess(ctx, chain)
+		slog.Info("scan round completed", "component", "scanner", "chain_id", chainID, "round", round, "duration", roundDuration.String(), "has_more", hasMore)
+		if !hasMore {
+			break
+		}
+	}
+
+	return fmt.Sprintf("scan completed: chain_id=%d rounds=%d has_more=%t duration=%s", chainID, rounds, hasMore, time.Since(start).String()), nil
 }
 
 // buildProcessScanEventCmd 构建事件消费任务的 cron 执行函数
 func (s *Scheduler) buildProcessScanEventCmd(job *entity.InfraJob) func() {
+	jobCopy := *job
 	return func() {
 		ctx := context.Background()
-		if err := processScanEvents(ctx, s.db); err != nil {
-			slog.Error("process scan events error", "error", err)
-		}
+		s.runWithJobLog(ctx, &jobCopy, func(ctx context.Context) (string, error) {
+			result, err := processScanEvents(ctx, s.db)
+			return fmt.Sprintf("process scan events completed: batches=%d claimed=%d duration=%s", result.Batches, result.Claimed, result.Duration.String()), err
+		})
 	}
 }
 
@@ -348,20 +387,34 @@ func buildCron(blockIntervalSecs int) string {
 	return fmt.Sprintf("*/%d * * * * *", secs)
 }
 
+type processScanEventsResult struct {
+	Batches  int
+	Claimed  int
+	Duration time.Duration
+}
+
 // processScanEvents 消费未处理的事件日志
-func processScanEvents(ctx context.Context, db *store.DB) error {
+func processScanEvents(ctx context.Context, db *store.DB) (processScanEventsResult, error) {
 	const batchSize = 100
 
+	start := time.Now()
+	result := processScanEventsResult{}
 	for {
 		events, err := db.ClaimUnprocessedEvents(ctx, batchSize)
 		if err != nil {
-			return fmt.Errorf("claim events: %w", err)
+			result.Duration = time.Since(start)
+			return result, fmt.Errorf("claim events: %w", err)
 		}
 
 		if len(events) == 0 {
-			return nil
+			result.Duration = time.Since(start)
+			slog.Info("process scan events completed", "component", "processor", "batches", result.Batches, "claimed", result.Claimed, "duration", result.Duration.String())
+			return result, nil
 		}
 
+		result.Batches++
+		result.Claimed += len(events)
+		slog.Info("claimed scan events", "component", "processor", "batch", result.Batches, "claimed", len(events))
 		for _, event := range events {
 			processor.RouteEvent(ctx, db, &event)
 		}
