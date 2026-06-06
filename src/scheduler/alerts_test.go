@@ -127,6 +127,80 @@ func TestRPCAlertSuccessBeforeThresholdResetsFailures(t *testing.T) {
 	}
 }
 
+func TestRPCAlertSanitizesURLSecretsFromErrorText(t *testing.T) {
+	fn := &fakeNotifier{}
+	now := time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)
+	manager := newRPCAlertManager(fn, 1, time.Hour, func() time.Time { return now })
+	chain := &entity.InfraEvmChain{ChainID: 137, Name: "Polygon", RPCURL: "https://rpc.example.com/key1234567890?token=secret"}
+
+	manager.recordFailure(context.Background(), chain, assertErr(`Post "https://rpc.example.com/key1234567890?token=secret": timeout`))
+	if len(fn.messages) != 1 {
+		t.Fatalf("messages after threshold = %d, want 1", len(fn.messages))
+	}
+
+	message := fn.messages[0]
+	for _, leaked := range []string{"key1234567890", "token=secret", "secret"} {
+		if strings.Contains(message, leaked) {
+			t.Fatalf("alert message leaked %q: %s", leaked, message)
+		}
+	}
+	if !strings.Contains(message, "timeout") {
+		t.Fatalf("alert message missing error context %q: %s", "timeout", message)
+	}
+}
+
+func TestRPCAlertRecoveryDoesNotClearNewFailureRecordedInFlight(t *testing.T) {
+	fn := newBlockingNotifier()
+	now := time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)
+	manager := newRPCAlertManager(fn, 1, time.Hour, func() time.Time { return now })
+	chain := &entity.InfraEvmChain{ChainID: 8453, Name: "Base", RPCURL: "https://rpc.example.com/key1234567890"}
+
+	manager.mu.Lock()
+	manager.states[chain.ChainID] = &rpcFailureState{
+		consecutiveFailures: 1,
+		lastError:           "delivered threshold failure",
+		alerting:            true,
+		lastNotifiedAt:      now,
+	}
+	manager.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		manager.recordSuccess(context.Background(), chain)
+	}()
+
+	fn.waitStarted(t)
+	manager.recordFailure(context.Background(), chain, assertErr("new failure while recovery is in flight"))
+
+	fn.unblock(nil)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for recovery send to finish")
+	}
+
+	manager.mu.Lock()
+	state := manager.states[chain.ChainID]
+	if state == nil {
+		manager.mu.Unlock()
+		t.Fatal("failure state missing after recovery race")
+	}
+	if state.consecutiveFailures == 0 {
+		manager.mu.Unlock()
+		t.Fatal("recovery cleared new failure recorded while send was in flight")
+	}
+	if !state.alerting {
+		manager.mu.Unlock()
+		t.Fatal("recovery cleared alerting state despite newer failure")
+	}
+	if state.recoveryNotifyInFlight {
+		manager.mu.Unlock()
+		t.Fatal("recovery in-flight flag still set after send completed")
+	}
+	manager.mu.Unlock()
+}
+
 func TestRPCAlertThresholdCooldownAndRecovery(t *testing.T) {
 	fn := &fakeNotifier{}
 	now := time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)

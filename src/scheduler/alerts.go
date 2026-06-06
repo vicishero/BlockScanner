@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,7 @@ type rpcFailureState struct {
 	alerting               bool
 	failureNotifyInFlight  bool
 	recoveryNotifyInFlight bool
+	version                uint64
 }
 
 type rpcAlertManager struct {
@@ -64,7 +66,8 @@ func (m *rpcAlertManager) recordFailure(ctx context.Context, chain *entity.Infra
 	}
 
 	state.consecutiveFailures++
-	state.lastError = err.Error()
+	state.version++
+	state.lastError = sanitizeRPCAlertError(chain.RPCURL, err)
 
 	shouldNotify := state.consecutiveFailures >= m.threshold && !state.failureNotifyInFlight && (state.lastNotifiedAt.IsZero() || m.cooldown <= 0 || currentTime.Sub(state.lastNotifiedAt) >= m.cooldown)
 	failures := state.consecutiveFailures
@@ -130,6 +133,7 @@ func (m *rpcAlertManager) recordSuccess(ctx context.Context, chain *entity.Infra
 	}
 
 	failures := state.consecutiveFailures
+	recoveryVersion := state.version
 	state.recoveryNotifyInFlight = true
 	m.mu.Unlock()
 
@@ -146,7 +150,7 @@ func (m *rpcAlertManager) recordSuccess(ctx context.Context, chain *entity.Infra
 	state = m.states[chain.ChainID]
 	if state != nil {
 		state.recoveryNotifyInFlight = false
-		if sendErr == nil {
+		if sendErr == nil && state.version == recoveryVersion {
 			state.consecutiveFailures = 0
 			state.lastError = ""
 			state.alerting = false
@@ -157,4 +161,40 @@ func (m *rpcAlertManager) recordSuccess(ctx context.Context, chain *entity.Infra
 	if sendErr != nil {
 		slog.Error("send rpc recovery notification failed", "component", "notifier", "chain_id", chain.ChainID, "error", sendErr)
 	}
+}
+
+func sanitizeRPCAlertError(rpcURL string, err error) string {
+	if err == nil {
+		return ""
+	}
+
+	text := err.Error()
+	if rpcURL != "" {
+		text = strings.ReplaceAll(text, rpcURL, notifier.RedactRPCURL(rpcURL))
+	}
+
+	return replaceRPCAlertURLTokens(text)
+}
+
+func replaceRPCAlertURLTokens(text string) string {
+	var b strings.Builder
+	for i := 0; i < len(text); {
+		if strings.HasPrefix(text[i:], "http://") || strings.HasPrefix(text[i:], "https://") {
+			end := i
+			for end < len(text) && !isRPCAlertURLDelimiter(text[end]) {
+				end++
+			}
+			b.WriteString(notifier.RedactRPCURL(text[i:end]))
+			i = end
+			continue
+		}
+
+		b.WriteByte(text[i])
+		i++
+	}
+	return b.String()
+}
+
+func isRPCAlertURLDelimiter(ch byte) bool {
+	return ch <= ' ' || strings.ContainsRune("\"'`<>()[]{}", rune(ch))
 }
