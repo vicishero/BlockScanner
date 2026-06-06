@@ -22,6 +22,7 @@ func (d *DB) UpsertJob(ctx context.Context, job *entity.InfraJob) error {
 	var existing entity.InfraJob
 	err := d.WithContext(ctx).
 		Where("handler_name = ? AND handler_param = ?", job.HandlerName, job.HandlerParam).
+		Where("deleted IS NULL OR deleted = ?", false).
 		First(&existing).Error
 
 	if err == nil {
