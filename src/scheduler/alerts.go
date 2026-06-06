@@ -153,6 +153,7 @@ func (m *rpcAlertManager) recordSuccess(ctx context.Context, chain *entity.Infra
 		if sendErr == nil && state.version == recoveryVersion {
 			state.consecutiveFailures = 0
 			state.lastError = ""
+			state.lastNotifiedAt = time.Time{}
 			state.alerting = false
 		}
 	}

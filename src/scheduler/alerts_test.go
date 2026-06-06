@@ -250,6 +250,39 @@ func TestRPCAlertThresholdCooldownAndRecovery(t *testing.T) {
 	}
 }
 
+func TestRPCAlertNewIncidentAfterRecoveryBypassesPreviousCooldown(t *testing.T) {
+	fn := &fakeNotifier{}
+	now := time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)
+	manager := newRPCAlertManager(fn, 1, 30*time.Minute, func() time.Time { return now })
+	chain := &entity.InfraEvmChain{ChainID: 8453, Name: "Base", RPCURL: "https://rpc.example.com/key1234567890"}
+
+	manager.recordFailure(context.Background(), chain, assertErr("initial outage"))
+	if len(fn.messages) != 1 {
+		t.Fatalf("messages after initial alert = %d, want 1", len(fn.messages))
+	}
+	if !strings.Contains(fn.messages[0], "RPC 连续失败告警") {
+		t.Fatalf("initial message missing alert title: %s", fn.messages[0])
+	}
+
+	now = now.Add(time.Minute)
+	manager.recordSuccess(context.Background(), chain)
+	if len(fn.messages) != 2 {
+		t.Fatalf("messages after recovery = %d, want 2", len(fn.messages))
+	}
+	if !strings.Contains(fn.messages[1], "RPC 已恢复") {
+		t.Fatalf("second message missing recovery title: %s", fn.messages[1])
+	}
+
+	now = now.Add(time.Minute)
+	manager.recordFailure(context.Background(), chain, assertErr("new outage"))
+	if len(fn.messages) != 3 {
+		t.Fatalf("messages after new post-recovery alert = %d, want 3", len(fn.messages))
+	}
+	if !strings.Contains(fn.messages[2], "RPC 连续失败告警") {
+		t.Fatalf("third message missing alert title: %s", fn.messages[2])
+	}
+}
+
 func TestRPCAlertFailureNotifyInFlightSuppressesDuplicateInitialAlert(t *testing.T) {
 	fn := newBlockingNotifier()
 	now := time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)
