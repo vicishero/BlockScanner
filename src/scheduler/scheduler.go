@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
 	"blockscanner/entity"
+	"blockscanner/notifier"
 	"blockscanner/processor"
 	"blockscanner/scanner"
 	"blockscanner/store"
@@ -18,24 +20,47 @@ import (
 // Scheduler 定时任务调度器
 // 基于 infra_job 表的配置，管理扫链和事件消费的 cron 任务
 type Scheduler struct {
-	db      *store.DB
-	scanner *scanner.EvmScanner
-	cron    *cron.Cron
-	mu      sync.Mutex
-	jobIDs  map[string]cron.EntryID // key: "handler_name:handler_param"
+	db              *store.DB
+	scanner         *scanner.EvmScanner
+	cron            *cron.Cron
+	mu              sync.Mutex
+	jobs            map[string]scheduledJob // key: "handler_name:handler_param"
+	refreshInterval time.Duration
+	alerts          *rpcAlertManager
+}
+
+type scheduledJob struct {
+	entryID cron.EntryID
+	cron    string
+}
+
+type Option func(*Scheduler)
+
+func WithRefreshInterval(interval time.Duration) Option {
+	return func(s *Scheduler) {
+		if interval > 0 {
+			s.refreshInterval = interval
+		}
+	}
 }
 
 // New 创建调度器
-func New(db *store.DB, evmScanner *scanner.EvmScanner) *Scheduler {
-	return &Scheduler{
+func New(db *store.DB, evmScanner *scanner.EvmScanner, sender notifier.Sender, opts ...Option) *Scheduler {
+	s := &Scheduler{
 		db:      db,
 		scanner: evmScanner,
 		cron: cron.New(
 			cron.WithSeconds(), // 支持秒级 cron
 			cron.WithLocation(time.Local),
 		),
-		jobIDs: make(map[string]cron.EntryID),
+		jobs:            make(map[string]scheduledJob),
+		refreshInterval: 60 * time.Second,
+		alerts:          newRPCAlertManager(sender, 5, 30*time.Minute, time.Now),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Start 初始化并启动调度器
@@ -137,9 +162,11 @@ func (s *Scheduler) ensureJobsForAllChains(ctx context.Context) error {
 func (s *Scheduler) upsertCronJob(job *entity.InfraJob) {
 	key := jobKey(job.HandlerName, job.HandlerParam)
 
-	// 移除旧任务
-	if entryID, ok := s.jobIDs[key]; ok {
-		s.cron.Remove(entryID)
+	if existing, ok := s.jobs[key]; ok {
+		if existing.cron == job.CronExpression {
+			return
+		}
+		s.cron.Remove(existing.entryID)
 	}
 
 	// 根据 handler_name 创建对应的 cron 任务
@@ -148,7 +175,7 @@ func (s *Scheduler) upsertCronJob(job *entity.InfraJob) {
 	case "scanEvmChain":
 		cmd = s.buildScanEvmChainCmd(job)
 	case "processScanEvent":
-		cmd = s.buildProcessScanEventCmd()
+		cmd = s.buildProcessScanEventCmd(job)
 	default:
 		slog.Warn("unknown handler", "handler_name", job.HandlerName)
 		return
@@ -164,12 +191,22 @@ func (s *Scheduler) upsertCronJob(job *entity.InfraJob) {
 		return
 	}
 
-	s.jobIDs[key] = entryID
+	s.jobs[key] = scheduledJob{entryID: entryID, cron: job.CronExpression}
 	slog.Info("cron job registered",
 		"name", job.Name,
 		"handler", job.HandlerName,
 		"cron", job.CronExpression,
 	)
+}
+
+func (s *Scheduler) removeStaleCronJobs(validKeys map[string]bool) {
+	for key, job := range s.jobs {
+		if validKeys[key] {
+			continue
+		}
+		s.cron.Remove(job.entryID)
+		delete(s.jobs, key)
+	}
 }
 
 // buildScanEvmChainCmd 构建扫链任务的 cron 执行函数
@@ -218,7 +255,7 @@ func (s *Scheduler) buildScanEvmChainCmd(job *entity.InfraJob) func() {
 }
 
 // buildProcessScanEventCmd 构建事件消费任务的 cron 执行函数
-func (s *Scheduler) buildProcessScanEventCmd() func() {
+func (s *Scheduler) buildProcessScanEventCmd(job *entity.InfraJob) func() {
 	return func() {
 		ctx := context.Background()
 		if err := processScanEvents(ctx, s.db); err != nil {
@@ -230,6 +267,34 @@ func (s *Scheduler) buildProcessScanEventCmd() func() {
 // jobKey 生成任务的唯一键
 func jobKey(handlerName, handlerParam string) string {
 	return fmt.Sprintf("%s:%s", handlerName, handlerParam)
+}
+
+func effectiveJobs(jobs []entity.InfraJob, enabledChains map[int64]entity.InfraEvmChain) []entity.InfraJob {
+	effective := make([]entity.InfraJob, 0, len(jobs))
+	for _, job := range jobs {
+		if job.HandlerName != "scanEvmChain" {
+			effective = append(effective, job)
+			continue
+		}
+
+		chainID, err := strconv.ParseInt(job.HandlerParam, 10, 64)
+		if err != nil {
+			continue
+		}
+		if _, ok := enabledChains[chainID]; !ok {
+			continue
+		}
+		effective = append(effective, job)
+	}
+	return effective
+}
+
+func jobKeys(jobs []entity.InfraJob) map[string]bool {
+	keys := make(map[string]bool, len(jobs))
+	for _, job := range jobs {
+		keys[jobKey(job.HandlerName, job.HandlerParam)] = true
+	}
+	return keys
 }
 
 // buildChainScanJob 根据链配置构建定时任务实体
