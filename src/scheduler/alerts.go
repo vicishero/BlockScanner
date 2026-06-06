@@ -118,7 +118,13 @@ func (m *rpcAlertManager) recordSuccess(ctx context.Context, chain *entity.Infra
 		return
 	}
 
-	if !state.alerting || state.recoveryNotifyInFlight {
+	if state.recoveryNotifyInFlight {
+		m.mu.Unlock()
+		return
+	}
+	if !state.alerting {
+		state.consecutiveFailures = 0
+		state.lastError = ""
 		m.mu.Unlock()
 		return
 	}

@@ -80,6 +80,53 @@ func TestRPCAlertSendFailureDoesNotEnterAlertCooldown(t *testing.T) {
 	}
 }
 
+func TestRPCAlertSuccessBeforeThresholdResetsFailures(t *testing.T) {
+	fn := &fakeNotifier{}
+	now := time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)
+	manager := newRPCAlertManager(fn, 5, 30*time.Minute, func() time.Time { return now })
+	chain := &entity.InfraEvmChain{ChainID: 137, Name: "Polygon", RPCURL: "https://rpc.example.com/key1234567890?token=secret"}
+
+	for i := 0; i < 4; i++ {
+		manager.recordFailure(context.Background(), chain, assertErr("eth_blockNumber failed"))
+	}
+	if len(fn.messages) != 0 {
+		t.Fatalf("messages before threshold = %d, want 0", len(fn.messages))
+	}
+
+	manager.recordSuccess(context.Background(), chain)
+	if len(fn.messages) != 0 {
+		t.Fatalf("success before threshold sent notification, messages = %d, want 0", len(fn.messages))
+	}
+
+	manager.mu.Lock()
+	state := manager.states[chain.ChainID]
+	if state == nil {
+		manager.mu.Unlock()
+		t.Fatal("failure state missing after pre-threshold success")
+	}
+	if state.consecutiveFailures != 0 {
+		manager.mu.Unlock()
+		t.Fatalf("consecutive failures after pre-threshold success = %d, want 0", state.consecutiveFailures)
+	}
+	if state.lastError != "" {
+		manager.mu.Unlock()
+		t.Fatalf("last error after pre-threshold success = %q, want empty", state.lastError)
+	}
+	manager.mu.Unlock()
+
+	for i := 0; i < 4; i++ {
+		manager.recordFailure(context.Background(), chain, assertErr("eth_blockNumber failed again"))
+	}
+	if len(fn.messages) != 0 {
+		t.Fatalf("messages after four post-success failures = %d, want 0", len(fn.messages))
+	}
+
+	manager.recordFailure(context.Background(), chain, assertErr("threshold failure after reset"))
+	if len(fn.messages) != 1 {
+		t.Fatalf("messages at threshold after reset = %d, want 1", len(fn.messages))
+	}
+}
+
 func TestRPCAlertThresholdCooldownAndRecovery(t *testing.T) {
 	fn := &fakeNotifier{}
 	now := time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)
