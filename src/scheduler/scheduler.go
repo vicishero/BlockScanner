@@ -26,6 +26,7 @@ type Scheduler struct {
 	cron            *cron.Cron
 	mu              sync.Mutex
 	jobs            map[string]scheduledJob // key: "handler_name:handler_param"
+	runCtx          context.Context
 	refreshInterval time.Duration
 	alerts          *rpcAlertManager
 }
@@ -74,6 +75,9 @@ func New(db *store.DB, evmScanner *scanner.EvmScanner, sender notifier.Sender, o
 // Start 初始化并启动调度器
 func (s *Scheduler) Start(ctx context.Context) error {
 	s.registerHandlers()
+	s.mu.Lock()
+	s.runCtx = ctx
+	s.mu.Unlock()
 
 	if err := s.refreshJobs(ctx); err != nil {
 		return fmt.Errorf("refresh jobs: %w", err)
@@ -125,16 +129,17 @@ func (s *Scheduler) refreshJobs(ctx context.Context) error {
 	enabledChains := make(map[int64]entity.InfraEvmChain, len(chains))
 	for _, chain := range chains {
 		enabledChains[chain.ChainID] = chain
-
-		job := buildChainScanJob(&chain)
-		if err := s.db.UpsertJob(ctx, job); err != nil {
-			slog.Error("upsert chain scan job failed", "component", "scheduler", "chain_id", chain.ChainID, "error", err)
-		}
 	}
 
-	processJob := buildProcessScanEventJob()
-	if err := s.db.UpsertJob(ctx, processJob); err != nil {
-		slog.Error("upsert process scan event job failed", "component", "scheduler", "error", err)
+	existingJobs, err := s.db.GetJobs(ctx)
+	if err != nil {
+		return fmt.Errorf("get jobs: %w", err)
+	}
+
+	for _, job := range missingBuiltInJobs(chains, existingJobs) {
+		if err := s.db.UpsertJob(ctx, job); err != nil {
+			slog.Error("create built-in job failed", "component", "scheduler", "handler", job.HandlerName, "handler_param", job.HandlerParam, "error", err)
+		}
 	}
 
 	jobs, err := s.db.GetEnabledJobs(ctx)
@@ -219,6 +224,16 @@ func (s *Scheduler) removeStaleCronJobs(validKeys map[string]bool) {
 	}
 }
 
+func (s *Scheduler) jobContext() context.Context {
+	s.mu.Lock()
+	ctx := s.runCtx
+	s.mu.Unlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
 func (s *Scheduler) runWithJobLog(ctx context.Context, job *entity.InfraJob, run func(context.Context) (string, error)) {
 	start := time.Now()
 	jobLog := entity.InfraJobLog{
@@ -260,7 +275,7 @@ func (s *Scheduler) runWithJobLog(ctx context.Context, job *entity.InfraJob, run
 func (s *Scheduler) buildScanEvmChainCmd(job *entity.InfraJob) func() {
 	jobCopy := *job
 	return func() {
-		ctx := context.Background()
+		ctx := s.jobContext()
 		s.runWithJobLog(ctx, &jobCopy, func(ctx context.Context) (string, error) {
 			return s.executeScanEvmChain(ctx, &jobCopy)
 		})
@@ -297,13 +312,13 @@ func (s *Scheduler) executeScanEvmChain(ctx context.Context, job *entity.InfraJo
 		}
 
 		rounds++
-		s.alerts.recordSuccess(ctx, chain)
 		slog.Info("scan round completed", "component", "scanner", "chain_id", chainID, "round", round, "duration", roundDuration.String(), "has_more", hasMore)
 		if !hasMore {
 			break
 		}
 	}
 
+	s.alerts.recordSuccess(ctx, chain)
 	return fmt.Sprintf("scan completed: chain_id=%d rounds=%d has_more=%t duration=%s", chainID, rounds, hasMore, time.Since(start).String()), nil
 }
 
@@ -311,7 +326,7 @@ func (s *Scheduler) executeScanEvmChain(ctx context.Context, job *entity.InfraJo
 func (s *Scheduler) buildProcessScanEventCmd(job *entity.InfraJob) func() {
 	jobCopy := *job
 	return func() {
-		ctx := context.Background()
+		ctx := s.jobContext()
 		s.runWithJobLog(ctx, &jobCopy, func(ctx context.Context) (string, error) {
 			result, err := processScanEvents(ctx, s.db)
 			return fmt.Sprintf("process scan events completed: batches=%d claimed=%d duration=%s", result.Batches, result.Claimed, result.Duration.String()), err
@@ -350,6 +365,26 @@ func jobKeys(jobs []entity.InfraJob) map[string]bool {
 		keys[jobKey(job.HandlerName, job.HandlerParam)] = true
 	}
 	return keys
+}
+
+func missingBuiltInJobs(chains []entity.InfraEvmChain, existingJobs []entity.InfraJob) []*entity.InfraJob {
+	existingKeys := jobKeys(existingJobs)
+	missing := make([]*entity.InfraJob, 0, len(chains)+1)
+
+	for i := range chains {
+		job := buildChainScanJob(&chains[i])
+		if existingKeys[jobKey(job.HandlerName, job.HandlerParam)] {
+			continue
+		}
+		missing = append(missing, job)
+	}
+
+	processJob := buildProcessScanEventJob()
+	if !existingKeys[jobKey(processJob.HandlerName, processJob.HandlerParam)] {
+		missing = append(missing, processJob)
+	}
+
+	return missing
 }
 
 // buildChainScanJob 根据链配置构建定时任务实体

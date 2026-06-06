@@ -16,6 +16,15 @@ func (d *DB) GetEnabledJobs(ctx context.Context) ([]entity.InfraJob, error) {
 	return jobs, err
 }
 
+// GetJobs 获取所有未删除的定时任务，包括暂停任务。
+func (d *DB) GetJobs(ctx context.Context) ([]entity.InfraJob, error) {
+	var jobs []entity.InfraJob
+	err := d.WithContext(ctx).
+		Where("deleted IS NULL OR deleted = ?", false).
+		Find(&jobs).Error
+	return jobs, err
+}
+
 // UpsertJob 插入或更新定时任务
 func (d *DB) UpsertJob(ctx context.Context, job *entity.InfraJob) error {
 	// 简单 upsert: 先查后更新或创建
