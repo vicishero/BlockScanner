@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"blockscanner/entity"
+	"github.com/robfig/cron/v3"
 )
 
 func TestEffectiveJobsSkipsScanForDisabledChains(t *testing.T) {
@@ -33,5 +34,35 @@ func TestJobKeys(t *testing.T) {
 	}
 	if !keys["processScanEvent:"] {
 		t.Fatalf("missing process key")
+	}
+}
+
+func TestSyncJobRefreshAppliesEffectiveJobsAndRemovesStaleCronJobs(t *testing.T) {
+	jobs := []entity.InfraJob{
+		{HandlerName: "scanEvmChain", HandlerParam: "137", CronExpression: "*/2 * * * * *", Status: 1},
+		{HandlerName: "scanEvmChain", HandlerParam: "1", CronExpression: "*/12 * * * * *", Status: 1},
+		{HandlerName: "processScanEvent", HandlerParam: "", CronExpression: "*/5 * * * * *", Status: 1},
+	}
+	enabledChains := map[int64]entity.InfraEvmChain{137: {ChainID: 137, Name: "Polygon", Status: 1}}
+
+	s := &Scheduler{
+		cron: cron.New(cron.WithSeconds()),
+		jobs: map[string]scheduledJob{
+			"scanEvmChain:1": {entryID: 99, cron: "*/12 * * * * *"},
+		},
+	}
+	effectiveCount := s.refreshCronJobs(jobs, enabledChains)
+
+	if effectiveCount != 2 {
+		t.Fatalf("effectiveCount = %d, want 2", effectiveCount)
+	}
+	if _, ok := s.jobs["scanEvmChain:1"]; ok {
+		t.Fatalf("disabled-chain scan job remained after refresh")
+	}
+	if _, ok := s.jobs["scanEvmChain:137"]; !ok {
+		t.Fatalf("enabled-chain scan job was not registered")
+	}
+	if _, ok := s.jobs["processScanEvent:"]; !ok {
+		t.Fatalf("non-chain job was not registered")
 	}
 }

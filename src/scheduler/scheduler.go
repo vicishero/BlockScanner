@@ -109,14 +109,20 @@ func (s *Scheduler) syncJobs(ctx context.Context) error {
 		return fmt.Errorf("get enabled jobs: %w", err)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for _, job := range jobs {
-		s.upsertCronJob(&job)
+	chains, err := s.db.GetEnabledChains(ctx)
+	if err != nil {
+		return fmt.Errorf("get enabled chains: %w", err)
+	}
+	enabledChains := make(map[int64]entity.InfraEvmChain, len(chains))
+	for _, chain := range chains {
+		enabledChains[chain.ChainID] = chain
 	}
 
-	slog.Info("synced jobs from database", "count", len(jobs))
+	s.mu.Lock()
+	effectiveCount := s.refreshCronJobs(jobs, enabledChains)
+	s.mu.Unlock()
+
+	slog.Info("synced jobs from database", "count", len(jobs), "effective", effectiveCount)
 	return nil
 }
 
@@ -156,6 +162,16 @@ func (s *Scheduler) ensureJobsForAllChains(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (s *Scheduler) refreshCronJobs(jobs []entity.InfraJob, enabledChains map[int64]entity.InfraEvmChain) int {
+	effective := effectiveJobs(jobs, enabledChains)
+	validKeys := jobKeys(effective)
+	for _, job := range effective {
+		s.upsertCronJob(&job)
+	}
+	s.removeStaleCronJobs(validKeys)
+	return len(effective)
 }
 
 // upsertCronJob 动态添加或更新 cron 任务（需持有锁）
