@@ -53,6 +53,86 @@ func TestJobContextUsesSchedulerRunContext(t *testing.T) {
 	}
 }
 
+func TestStopWaitsForRunningCronJobs(t *testing.T) {
+	s := &Scheduler{cron: cron.New(cron.WithSeconds()), stopped: make(chan struct{})}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	_, err := s.cron.AddFunc("* * * * * *", func() {
+		close(started)
+		<-release
+		close(done)
+	})
+	if err != nil {
+		t.Fatalf("AddFunc failed: %v", err)
+	}
+	s.cron.Start()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for cron job to start")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		stopDone <- s.Stop(ctx)
+	}()
+
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop returned before job completed with error: %v", err)
+		}
+		t.Fatal("Stop returned before running job completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for cron job to finish")
+	}
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Stop after job completed")
+	}
+}
+
+func TestStopReturnsContextErrorWhenShutdownTimeoutExpires(t *testing.T) {
+	s := &Scheduler{cron: cron.New(cron.WithSeconds()), stopped: make(chan struct{})}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	_, err := s.cron.AddFunc("* * * * * *", func() {
+		close(started)
+		<-release
+	})
+	if err != nil {
+		t.Fatalf("AddFunc failed: %v", err)
+	}
+	s.cron.Start()
+	defer close(release)
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for cron job to start")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := s.Stop(ctx); err != context.DeadlineExceeded {
+		t.Fatalf("Stop error = %v, want %v", err, context.DeadlineExceeded)
+	}
+}
+
 func TestMissingBuiltInJobsPreservesExistingEnabledAndPausedJobs(t *testing.T) {
 	chains := []entity.InfraEvmChain{
 		{ChainID: 137, Name: "Polygon", BlockIntervalSecs: 2, Status: 1},

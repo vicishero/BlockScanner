@@ -29,6 +29,8 @@ type Scheduler struct {
 	runCtx          context.Context
 	refreshInterval time.Duration
 	alerts          *rpcAlertManager
+	stopOnce        sync.Once
+	stopped         chan struct{}
 }
 
 type scheduledJob struct {
@@ -65,6 +67,7 @@ func New(db *store.DB, evmScanner *scanner.EvmScanner, sender notifier.Sender, o
 		jobs:            make(map[string]scheduledJob),
 		refreshInterval: 60 * time.Second,
 		alerts:          newRPCAlertManager(sender, 5, 30*time.Minute, time.Now),
+		stopped:         make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -90,13 +93,31 @@ func (s *Scheduler) Start(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
+		s.stop()
+	}()
+
+	return nil
+}
+
+func (s *Scheduler) stop() {
+	s.stopOnce.Do(func() {
 		slog.Info("scheduler stopping", "component", "scheduler")
 		stopCtx := s.cron.Stop()
 		<-stopCtx.Done()
 		slog.Info("scheduler stopped", "component", "scheduler")
-	}()
+		close(s.stopped)
+	})
+}
 
-	return nil
+// Stop stops the scheduler and waits for running cron jobs to finish or ctx to expire.
+func (s *Scheduler) Stop(ctx context.Context) error {
+	go s.stop()
+	select {
+	case <-s.stopped:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // registerHandlers 注册所有任务处理器

@@ -76,8 +76,11 @@ func main() {
 	shutdownTimeout := time.Duration(cfg.App.ShutdownTimeoutSecs) * time.Second
 	slog.Info("waiting for graceful shutdown...", "timeout", shutdownTimeout)
 
-	// 给调度器和扫描器一些时间清理
-	time.Sleep(2 * time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
+	if err := sched.Stop(shutdownCtx); err != nil {
+		slog.Error("scheduler shutdown timed out", "timeout", shutdownTimeout, "error", err)
+	}
 
 	slog.Info("BlockScanner stopped")
 }
