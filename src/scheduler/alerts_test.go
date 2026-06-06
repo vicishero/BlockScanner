@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -126,6 +127,170 @@ func TestRPCAlertThresholdCooldownAndRecovery(t *testing.T) {
 	if len(fn.messages) != 3 {
 		t.Fatalf("second success sent duplicate recovery, messages = %d", len(fn.messages))
 	}
+}
+
+func TestRPCAlertFailureNotifyInFlightSuppressesDuplicateInitialAlert(t *testing.T) {
+	fn := newBlockingNotifier()
+	now := time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)
+	manager := newRPCAlertManager(fn, 1, time.Hour, func() time.Time { return now })
+	chain := &entity.InfraEvmChain{ChainID: 10, Name: "Optimism", RPCURL: "https://rpc.example.com/key1234567890"}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		manager.recordFailure(context.Background(), chain, assertErr("threshold failure"))
+	}()
+
+	fn.waitStarted(t)
+	manager.recordFailure(context.Background(), chain, assertErr("concurrent threshold failure"))
+	if attempts := fn.attempts(); attempts != 1 {
+		t.Fatalf("send attempts while first alert in flight = %d, want 1", attempts)
+	}
+
+	fn.unblock(nil)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial alert send to finish")
+	}
+	if attempts := fn.attempts(); attempts != 1 {
+		t.Fatalf("send attempts after unblocking initial alert = %d, want 1", attempts)
+	}
+
+	manager.recordFailure(context.Background(), chain, assertErr("inside cooldown failure"))
+	if attempts := fn.attempts(); attempts != 1 {
+		t.Fatalf("send attempts inside cooldown = %d, want 1", attempts)
+	}
+}
+
+func TestRPCAlertRecoverySendFailureRetriesUntilDelivered(t *testing.T) {
+	fn := &sequencedNotifier{errs: []error{nil, errors.New("recovery unavailable"), nil}}
+	now := time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)
+	manager := newRPCAlertManager(fn, 1, time.Hour, func() time.Time { return now })
+	chain := &entity.InfraEvmChain{ChainID: 8453, Name: "Base", RPCURL: "https://rpc.example.com/key1234567890"}
+
+	manager.recordFailure(context.Background(), chain, assertErr("threshold failure"))
+	if attempts := fn.attempts(); attempts != 1 {
+		t.Fatalf("send attempts after delivered failure alert = %d, want 1", attempts)
+	}
+
+	manager.recordSuccess(context.Background(), chain)
+	if attempts := fn.attempts(); attempts != 2 {
+		t.Fatalf("send attempts after failed recovery = %d, want 2", attempts)
+	}
+	manager.mu.Lock()
+	state := manager.states[chain.ChainID]
+	if state == nil {
+		manager.mu.Unlock()
+		t.Fatal("failure state missing after failed recovery")
+	}
+	if !state.alerting {
+		manager.mu.Unlock()
+		t.Fatal("state not alerting after failed recovery, want alerting so success can retry")
+	}
+	manager.mu.Unlock()
+
+	manager.recordSuccess(context.Background(), chain)
+	if attempts := fn.attempts(); attempts != 3 {
+		t.Fatalf("send attempts after recovery retry = %d, want 3", attempts)
+	}
+	if msg := fn.message(2); !strings.Contains(msg, "RPC 已恢复") {
+		t.Fatalf("recovery retry message missing title: %s", msg)
+	}
+
+	manager.recordSuccess(context.Background(), chain)
+	if attempts := fn.attempts(); attempts != 3 {
+		t.Fatalf("send attempts after subsequent success = %d, want 3", attempts)
+	}
+}
+
+type blockingNotifier struct {
+	mu       sync.Mutex
+	messages []string
+	started  chan struct{}
+	release  chan error
+}
+
+func newBlockingNotifier() *blockingNotifier {
+	return &blockingNotifier{
+		started: make(chan struct{}, 1),
+		release: make(chan error),
+	}
+}
+
+func (f *blockingNotifier) SendMessage(ctx context.Context, text string) error {
+	f.mu.Lock()
+	f.messages = append(f.messages, text)
+	attempts := len(f.messages)
+	f.mu.Unlock()
+
+	if attempts > 1 {
+		return errors.New("unexpected duplicate send")
+	}
+
+	select {
+	case f.started <- struct{}{}:
+	default:
+	}
+
+	select {
+	case err := <-f.release:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (f *blockingNotifier) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for send attempt to start")
+	}
+}
+
+func (f *blockingNotifier) unblock(err error) {
+	f.release <- err
+}
+
+func (f *blockingNotifier) attempts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.messages)
+}
+
+type sequencedNotifier struct {
+	mu       sync.Mutex
+	messages []string
+	errs     []error
+}
+
+func (f *sequencedNotifier) SendMessage(ctx context.Context, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.messages = append(f.messages, text)
+	attempt := len(f.messages) - 1
+	if attempt < len(f.errs) {
+		return f.errs[attempt]
+	}
+	return nil
+}
+
+func (f *sequencedNotifier) attempts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.messages)
+}
+
+func (f *sequencedNotifier) message(index int) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if index >= len(f.messages) {
+		return ""
+	}
+	return f.messages[index]
 }
 
 type assertErr string

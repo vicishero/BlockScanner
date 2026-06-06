@@ -12,10 +12,12 @@ import (
 )
 
 type rpcFailureState struct {
-	consecutiveFailures int
-	lastError           string
-	lastNotifiedAt      time.Time
-	alerting            bool
+	consecutiveFailures    int
+	lastError              string
+	lastNotifiedAt         time.Time
+	alerting               bool
+	failureNotifyInFlight  bool
+	recoveryNotifyInFlight bool
 }
 
 type rpcAlertManager struct {
@@ -64,9 +66,12 @@ func (m *rpcAlertManager) recordFailure(ctx context.Context, chain *entity.Infra
 	state.consecutiveFailures++
 	state.lastError = err.Error()
 
-	shouldNotify := state.consecutiveFailures >= m.threshold && (state.lastNotifiedAt.IsZero() || m.cooldown <= 0 || currentTime.Sub(state.lastNotifiedAt) >= m.cooldown)
+	shouldNotify := state.consecutiveFailures >= m.threshold && !state.failureNotifyInFlight && (state.lastNotifiedAt.IsZero() || m.cooldown <= 0 || currentTime.Sub(state.lastNotifiedAt) >= m.cooldown)
 	failures := state.consecutiveFailures
 	lastError := state.lastError
+	if shouldNotify {
+		state.failureNotifyInFlight = true
+	}
 	m.mu.Unlock()
 
 	if !shouldNotify {
@@ -81,18 +86,22 @@ func (m *rpcAlertManager) recordFailure(ctx context.Context, chain *entity.Infra
 		lastError,
 		currentTime.Format(time.RFC3339),
 	)
-	if sendErr := m.sender.SendMessage(ctx, message); sendErr != nil {
-		slog.Error("send rpc alert notification failed", "component", "notifier", "chain_id", chain.ChainID, "error", sendErr)
-		return
-	}
+	sendErr := m.sender.SendMessage(ctx, message)
 
 	m.mu.Lock()
 	state = m.states[chain.ChainID]
-	if state != nil && state.consecutiveFailures >= failures {
-		state.alerting = true
-		state.lastNotifiedAt = currentTime
+	if state != nil {
+		state.failureNotifyInFlight = false
+		if sendErr == nil && state.consecutiveFailures >= failures {
+			state.alerting = true
+			state.lastNotifiedAt = currentTime
+		}
 	}
 	m.mu.Unlock()
+
+	if sendErr != nil {
+		slog.Error("send rpc alert notification failed", "component", "notifier", "chain_id", chain.ChainID, "error", sendErr)
+	}
 }
 
 func (m *rpcAlertManager) recordSuccess(ctx context.Context, chain *entity.InfraEvmChain) {
@@ -109,16 +118,14 @@ func (m *rpcAlertManager) recordSuccess(ctx context.Context, chain *entity.Infra
 		return
 	}
 
-	wasAlerting := state.alerting
-	failures := state.consecutiveFailures
-	state.consecutiveFailures = 0
-	state.lastError = ""
-	state.alerting = false
-	m.mu.Unlock()
-
-	if !wasAlerting {
+	if !state.alerting || state.recoveryNotifyInFlight {
+		m.mu.Unlock()
 		return
 	}
+
+	failures := state.consecutiveFailures
+	state.recoveryNotifyInFlight = true
+	m.mu.Unlock()
 
 	message := fmt.Sprintf("[BlockScanner] RPC 已恢复\n链: %s (%d)\nRPC: %s\n此前连续失败: %d\n时间: %s",
 		chain.Name,
@@ -127,7 +134,21 @@ func (m *rpcAlertManager) recordSuccess(ctx context.Context, chain *entity.Infra
 		failures,
 		currentTime.Format(time.RFC3339),
 	)
-	if sendErr := m.sender.SendMessage(ctx, message); sendErr != nil {
+	sendErr := m.sender.SendMessage(ctx, message)
+
+	m.mu.Lock()
+	state = m.states[chain.ChainID]
+	if state != nil {
+		state.recoveryNotifyInFlight = false
+		if sendErr == nil {
+			state.consecutiveFailures = 0
+			state.lastError = ""
+			state.alerting = false
+		}
+	}
+	m.mu.Unlock()
+
+	if sendErr != nil {
 		slog.Error("send rpc recovery notification failed", "component", "notifier", "chain_id", chain.ChainID, "error", sendErr)
 	}
 }
