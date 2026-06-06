@@ -82,7 +82,7 @@ func (w *ChainWorker) ScanRound(ctx context.Context) (hasMore bool, err error) {
 		confirmed = 0
 	}
 
-	slog.Info("scan round loaded chain state",
+	slog.Debug("scan round loaded chain state",
 		"component", "scanner",
 		"chain_id", w.chainID,
 		"chain_name", chain.Name,
@@ -174,7 +174,7 @@ func (w *ChainWorker) ScanRound(ctx context.Context) (hasMore bool, err error) {
 		)
 		return false, fmt.Errorf("eth_getLogs: %w", err)
 	}
-	slog.Info("rpc get logs completed",
+	slog.Debug("rpc get logs completed",
 		"component", "rpc",
 		"chain_id", w.chainID,
 		"from_block", fromBlock,
@@ -190,7 +190,7 @@ func (w *ChainWorker) ScanRound(ctx context.Context) (hasMore bool, err error) {
 			return false, fmt.Errorf("update last_synced_block: %w", err)
 		}
 		hasMore = toBlock < confirmed
-		slog.Info("scan round advanced without logs",
+		slog.Debug("scan round advanced without logs",
 			"component", "scanner",
 			"chain_id", w.chainID,
 			"from_block", fromBlock,
@@ -300,7 +300,7 @@ func (w *ChainWorker) ScanRound(ctx context.Context) (hasMore bool, err error) {
 
 	// 13. 判断是否还有剩余块
 	hasMore = toBlock < confirmed
-	slog.Info("scan round completed",
+	slog.Debug("scan round completed",
 		"component", "scanner",
 		"chain_id", w.chainID,
 		"from_block", fromBlock,
